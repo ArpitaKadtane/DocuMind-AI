@@ -21,6 +21,7 @@ from app.pdf_processor import (
     extract_pages_from_pdf,
     _max_bytes,
 )
+from app.quiz import QuizGenerationError, QuizStore, create_quiz
 from app.rag import answer_question
 from app.storage import DocumentStore
 from app.summary import summarize_document
@@ -57,6 +58,14 @@ DOCUMENTS: dict[str, dict] = {}
 # SQLite + file persistence. Initialised lazily so tests can substitute a
 # temporary directory, and used to restore documents after a restart.
 DOCUMENT_STORE: DocumentStore | None = None
+
+# In-memory store for generated quizzes. Deliberately ephemeral: answers stay
+# server-side until submission, quizzes expire, and memory stays bounded (see
+# app/quiz.py). Not persisted and not shared across worker processes.
+QUIZS = QuizStore(
+    ttl_minutes=settings.quiz_ttl_minutes,
+    max_stored=settings.quiz_max_stored,
+)
 
 
 def get_document_store() -> DocumentStore:
@@ -124,6 +133,15 @@ app.include_router(auth_router)
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000)
+
+
+class QuizRequest(BaseModel):
+    count: int = Field(default=5, ge=1, le=settings.quiz_max_questions)
+    num_options: int = Field(default=4, ge=2, le=settings.quiz_max_options)
+
+
+class QuizSubmitRequest(BaseModel):
+    answers: list[int | None] = Field(default_factory=list)
 
 
 def get_owned_document(
@@ -368,6 +386,127 @@ def summarize_document_endpoint(
         "document_id": document_id,
         "filename": doc["filename"],
         **result,
+    }
+
+
+@app.post("/documents/{document_id}/quiz")
+def generate_document_quiz(
+    document_id: str,
+    payload: QuizRequest,
+    doc: dict = Depends(get_owned_document),
+):
+    """Generate a multiple-choice quiz and keep its answer key server-side."""
+    if not doc["chunks"]:
+        raise HTTPException(
+            status_code=400,
+            detail="This document has no text to build a quiz from.",
+        )
+
+    try:
+        result = create_quiz(
+            doc["chunks"], doc["chunk_pages"], payload.count, payload.num_options
+        )
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except QuizGenerationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    quiz_id = uuid.uuid4().hex
+    QUIZS.add(
+        quiz_id=quiz_id,
+        document_id=document_id,
+        owner_id=doc["owner_id"],
+        filename=doc["filename"],
+        questions=result["questions"],
+    )
+
+    # Only the question text, options, and source page are returned -- never the
+    # answer index or explanation, which stay in the server-side quiz.
+    public_questions = [
+        {
+            "index": index,
+            "question": question["question"],
+            "options": question["options"],
+            "page": question["page"],
+        }
+        for index, question in enumerate(result["questions"])
+    ]
+    logger.info(
+        "generated quiz document=%s questions=%d truncated=%s",
+        document_id,
+        len(public_questions),
+        result["truncated"],
+    )
+    return {
+        "quiz_id": quiz_id,
+        "document_id": document_id,
+        "filename": doc["filename"],
+        "count": len(public_questions),
+        "num_options": payload.num_options,
+        "truncated": result["truncated"],
+        "questions": public_questions,
+    }
+
+
+@app.post("/documents/{document_id}/quiz/{quiz_id}/submit")
+def submit_document_quiz(
+    document_id: str,
+    quiz_id: str,
+    payload: QuizSubmitRequest,
+    doc: dict = Depends(get_owned_document),
+    user: dict = Depends(get_current_user),
+):
+    """Grade a quiz and reveal the correct answers and explanations."""
+    quiz = QUIZS.get(quiz_id)
+    if (
+        quiz is None
+        or quiz["document_id"] != document_id
+        or quiz["owner_id"] != user["user_id"]
+    ):
+        # Unknown, expired, foreign, or mismatched quizzes are indistinguishable.
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+
+    questions = quiz["questions"]
+    answers = payload.answers
+    if len(answers) != len(questions):
+        raise HTTPException(
+            status_code=422, detail="Provide exactly one answer per question."
+        )
+
+    results = []
+    correct_total = 0
+    for index, question in enumerate(questions):
+        selected = answers[index]
+        if selected is not None and (
+            isinstance(selected, bool) or not 0 <= selected < len(question["options"])
+        ):
+            raise HTTPException(
+                status_code=422, detail=f"Answer {index + 1} is out of range."
+            )
+        is_correct = selected == question["answer_index"]
+        correct_total += int(is_correct)
+        results.append(
+            {
+                "index": index,
+                "question": question["question"],
+                "options": question["options"],
+                "selected_index": selected,
+                "correct_index": question["answer_index"],
+                "correct": is_correct,
+                "explanation": question["explanation"],
+                "page": question["page"],
+            }
+        )
+
+    total = len(questions)
+    percent = round(correct_total / total * 100) if total else 0
+    logger.info(
+        "graded quiz=%s correct=%d total=%d", quiz_id, correct_total, total
+    )
+    return {
+        "quiz_id": quiz_id,
+        "score": {"correct": correct_total, "total": total, "percent": percent},
+        "results": results,
     }
 
 

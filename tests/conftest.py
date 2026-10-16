@@ -45,10 +45,12 @@ def fake_embeddings(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clean_documents():
-    """Ensure the in-memory document store is empty before each test."""
+    """Ensure the in-memory document and quiz stores are empty before each test."""
     main.DOCUMENTS.clear()
+    main.QUIZS.clear()
     yield
     main.DOCUMENTS.clear()
+    main.QUIZS.clear()
 
 
 @pytest.fixture(autouse=True)

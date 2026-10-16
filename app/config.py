@@ -63,6 +63,16 @@ class Settings:
     summary_max_tokens: int = _get_int("SUMMARY_MAX_TOKENS", 700)
     summary_max_points: int = _get_int("SUMMARY_MAX_POINTS", 8)
 
+    # Quizzes
+    quiz_max_questions: int = _get_int("QUIZ_MAX_QUESTIONS", 15)
+    quiz_max_options: int = _get_int("QUIZ_MAX_OPTIONS", 6)
+    quiz_max_chars: int = _get_int("QUIZ_MAX_CHARS", 12000)
+    quiz_max_tokens: int = _get_int("QUIZ_MAX_TOKENS", 1500)
+    # How long a generated quiz stays available before it is discarded, and how
+    # many quizzes are held in memory at once (oldest are evicted first).
+    quiz_ttl_minutes: int = _get_int("QUIZ_TTL_MINUTES", 60)
+    quiz_max_stored: int = _get_int("QUIZ_MAX_STORED", 100)
+
     # Auth / sessions
     session_ttl_hours: int = _get_int("SESSION_TTL_HOURS", 168)
 

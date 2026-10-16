@@ -46,11 +46,12 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
 - 🚫 **Refuses to answer** when nothing relevant is found (score gate + prompt rule)
 - 📑 **Page-aware citations** — every answer cites the PDF page(s) it used, and search hits carry the filename + 1-based page number
 - 📝 **AI summaries & key points** — one click summarizes a whole document and lists its most important points, grounded in the text; large PDFs are sampled evenly so the beginning, middle, and end all count
+- 🎯 **AI-generated quizzes** — turn a document into multiple-choice questions and take them in the browser, one at a time; the answer key stays server-side until you submit, then you see your score and a full review with source pages
 - 🛡️ Prompt-injection defense: document text is treated as untrusted data
 - 💾 **Persistent storage** — uploaded PDFs, metadata, and search vectors are saved with SQLite and restored after a restart
 - 🔐 **Accounts & per-user ownership** — register/login with bearer tokens; users can only see and query their own documents
 - 🌐 Simple built-in web frontend (plain HTML/JS, no build step)
-- ✅ 101 automated tests that run offline in a few seconds
+- ✅ 142 automated tests that run offline in a few seconds
 
 ---
 
@@ -155,6 +156,12 @@ Copy `.env.example` to `.env` and fill in your values. **Never commit `.env`** (
 | `SUMMARY_MAX_CHARS` | `12000` | If a document is larger than this, summary chunks are sampled evenly across it |
 | `SUMMARY_MAX_TOKENS` | `700` | Max tokens the model may use for a summary |
 | `SUMMARY_MAX_POINTS` | `8` | Max number of key points to return |
+| `QUIZ_MAX_QUESTIONS` | `15` | Max questions a quiz may request |
+| `QUIZ_MAX_OPTIONS` | `6` | Max answer options per question |
+| `QUIZ_MAX_CHARS` | `12000` | Max document-context characters sent when building a quiz (large docs are sampled) |
+| `QUIZ_MAX_TOKENS` | `1500` | Max tokens the model may use for a quiz |
+| `QUIZ_TTL_MINUTES` | `60` | How long a generated quiz stays valid before it is discarded |
+| `QUIZ_MAX_STORED` | `100` | How many generated quizzes are kept in memory (oldest evicted first) |
 | `DATA_DIR` | `./data` | Directory for stored PDFs and the SQLite database (created automatically) |
 | `SESSION_TTL_HOURS` | `168` | How long a login token stays valid (7 days) |
 | `CHUNK_SIZE_CHARS` | `800` | Max characters per chunk |
@@ -239,6 +246,8 @@ Every user must **register** and **log in** before they can upload or query docu
 | `POST` | `/documents/{id}/search?query=…` | Raw retrieval — matched chunks with `filename`, `page`, and `score` | ✔ |
 | `POST` | `/documents/{id}/ask` | RAG Q&A — body: `{"question": "…"}` | ✔ |
 | `POST` | `/documents/{id}/summary` | Whole-document summary + key points | ✔ |
+| `POST` | `/documents/{id}/quiz` | Generate a multiple-choice quiz (answers kept server-side) — body: `{"count": 5, "num_options": 4}` | ✔ |
+| `POST` | `/documents/{id}/quiz/{quiz_id}/submit` | Grade a quiz — body: `{"answers": [0, 2, null, …]}` | ✔ |
 
 **Example:**
 
@@ -330,6 +339,75 @@ citation shape in `sources` and never invents page numbers.
 }
 ```
 
+### Quizzes
+
+`POST /documents/{id}/quiz` turns a document into multiple-choice questions.
+Like summaries, the questions are built from the document's own chunks (sampled
+evenly for large documents, with `truncated: true` when that happens), and every
+question is grounded in the text — the prompt forbids inventing facts, and page
+numbers are accepted only if they refer to a page that was actually in the
+context.
+
+**The answer key never leaves the server on generation.** The response contains
+only the question text, options, and source page; the correct option and
+explanation are held server-side, expire after `QUIZ_TTL_MINUTES`, and are
+revealed only when you submit.
+
+```json
+{
+  "quiz_id": "3b1e9c…",
+  "document_id": "…",
+  "filename": "sample.pdf",
+  "count": 5,
+  "num_options": 4,
+  "truncated": false,
+  "questions": [
+    {
+      "index": 0,
+      "question": "What is the Phase One budget?",
+      "options": ["5000 credits", "10000 credits", "250 credits", "50000 credits"],
+      "page": 1
+    }
+  ]
+}
+```
+
+Then grade it with `POST /documents/{id}/quiz/{quiz_id}/submit`:
+
+```json
+{ "answers": [0, 2, 1, null, 3] }
+```
+
+```json
+{
+  "quiz_id": "3b1e9c…",
+  "score": { "correct": 3, "total": 5, "percent": 60 },
+  "results": [
+    {
+      "index": 0,
+      "question": "What is the Phase One budget?",
+      "options": ["5000 credits", "10000 credits", "250 credits", "50000 credits"],
+      "selected_index": 0,
+      "correct_index": 0,
+      "correct": true,
+      "explanation": "The report states the Phase One budget is 5000 credits.",
+      "page": 1
+    }
+  ]
+}
+```
+
+Model output is untrusted: it is parsed as JSON and every question is validated.
+Malformed questions (missing fields, too few options, out-of-range answers) and
+duplicates are dropped rather than repaired, the requested count and option
+limits are enforced, and if nothing usable remains the API returns **502**
+instead of inventing questions. Generated quizzes live **in memory only** — they
+are lost on restart and are not shared between worker processes.
+
+> Note: the quiz UI hides the answer key, but the correct answers *are* returned
+> by the submit endpoint (by design) — so a user can always see their own
+> results. Answers are never exposed by the generation endpoint.
+
 ---
 
 ## How the answer is generated
@@ -355,7 +433,7 @@ citation shape in `sources` and never invents page numbers.
 pytest
 ```
 
-The suite covers document processing, chunking, vector search, RAG gating, API behaviour, persistence, authentication/ownership, **page-aware citations**, and **summaries & key points** — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request), restart restoration (missing files, corrupt records), page metadata surviving a restart, legacy chunks without a page ("page unavailable"), the chunks-table migration, summary output parsing and large-PDF chunk sampling, and auth cases (unauthenticated requests, invalid tokens, logout, cross-user access, legacy documents, schema migration). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
+The suite covers document processing, chunking, vector search, RAG gating, API behaviour, persistence, authentication/ownership, **page-aware citations**, **summaries & key points**, and **quizzes** — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request), restart restoration (missing files, corrupt records), page metadata surviving a restart, legacy chunks without a page ("page unavailable"), the chunks-table migration, summary output parsing and large-PDF chunk sampling, quiz JSON parsing/validation (malformed output, missing fields, duplicate questions, out-of-range answers, option caps), quiz page-reference validation, quiz store expiration/capacity, server-side grading, and answer-key non-leakage, plus auth cases (unauthenticated requests, invalid tokens, logout, cross-user access, legacy documents, schema migration). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
 
 ---
 
@@ -376,6 +454,7 @@ DocumentAssistant/
 │   ├── llm.py             # Groq API call + grounding prompt
 │   ├── rag.py             # Retrieval → score gate → answer
 │   ├── summary.py         # Whole-document summarization (grounded, page-aware)
+│   ├── quiz.py            # Quiz generation, validation, and in-memory store
 │   └── static/index.html  # Web frontend (with sign-in)
 ├── tests/                 # pytest suite (offline)
 ├── documents/             # Sample PDFs
@@ -396,7 +475,9 @@ DocumentAssistant/
 - **Logs contain metadata only** (document id, filename, page count, chunk count, found/not-found) — never document text, questions, answers, or keys.
 - **Prompt injection:** document text is wrapped in `<document_context>` tags and the system prompt marks it as untrusted data, so instructions embedded in a PDF are ignored.
 - **A request-size middleware** rejects oversized bodies before reading them, on top of the real size check while streaming the upload.
-- **Per-user isolation:** every document endpoint is gated by ownership. A missing id and a foreign id return the identical 404, so ids can't be probed for existence.
+- **Per-user isolation:** every document endpoint is gated by ownership. A missing id and a foreign id return the identical 404, so ids can't be probed for existence. Quiz submission checks both document ownership and quiz ownership, and returns the same 404 for unknown, expired, foreign, or mismatched quizzes.
+- **Quiz answer keys stay server-side:** the generation endpoint returns only question text, options, and source pages. Correct answers and explanations are held in memory and revealed only by the submit endpoint, so the UI never ships the key to the browser.
+- **Untrusted model output:** quiz JSON is parsed and validated defensively — malformed, duplicate, or out-of-range questions are dropped, never "fixed", and page numbers are accepted only if they appeared in the sampled context.
 - **Password storage:** scrypt with a per-user salt; only scrypt hashes are stored. Login returns a generic "Incorrect email or password" for both unknown emails and wrong passwords, so accounts can't be enumerated.
 - **Token storage:** sessions persist only a SHA-256 hash of the bearer token, so a DB leak can't be replayed. Expired/unknown tokens are rejected and purged on use.
 - **Auth is standard-library only** — no extra crypto dependency to keep updated or audit for Python-version support.
@@ -413,6 +494,7 @@ DocumentAssistant/
 - **No email verification or password reset** — sign-up is open; add those before any public deployment. No rate limiting on login yet (brute force is unmitigated).
 - **Free-tier Groq limits** — the model can change or be rate-limited; `GROQ_MODEL` is configurable for that reason. (`llama-3.3-70b-versatile` is now an Enterprise model and is **not** available on the free tier.)
 - **Embeddings are tied to the model** — search vectors stored in the database are only comparable to queries embedded with the same `EMBEDDING_MODEL`. Changing the model means re-uploading documents.
+- **Quizzes are in-memory and ephemeral** — a generated quiz is lost when the server restarts and is **not** shared across multiple worker processes. They expire after `QUIZ_TTL_MINUTES` and are capped by `QUIZ_MAX_STORED`; regenerate if a quiz has expired.
 
 ---
 
@@ -422,6 +504,7 @@ DocumentAssistant/
 - ~~User accounts and per-user document ownership~~ ✅ done in M2
 - ~~Page-aware citations (filename + page in search and answers)~~ ✅ done in M3
 - ~~AI summaries & key points~~ ✅ done in M4
+- ~~AI-generated quizzes (server-side graded)~~ ✅ done in M5
 - Support several documents / global search across them
 - Add OCR for scanned PDFs
 - Email verification, password reset, and login rate limiting

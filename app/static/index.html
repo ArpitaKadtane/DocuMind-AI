@@ -92,6 +92,33 @@
     }
     .keypoints { margin: 8px 0 0; padding-left: 20px; }
     .keypoints li { margin-bottom: 4px; }
+    .quiz-row { display: flex; gap: 8px; align-items: center; }
+    .quiz-row input[type="number"] {
+      width: 90px;
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 1rem;
+    }
+    .quiz-progress { color: var(--muted); font-size: .9rem; margin: 12px 0 6px; }
+    .quiz-question { font-weight: 600; margin-bottom: 10px; }
+    .quiz-option {
+      display: block;
+      padding: 8px 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    .quiz-option:hover { background: #f9fafb; }
+    .quiz-option input { margin-right: 8px; }
+    .quiz-nav { margin-top: 8px; }
+    .quiz-review-item { border-top: 1px solid #eee; padding: 10px 0; }
+    .quiz-review-q { font-weight: 600; margin-bottom: 6px; }
+    .quiz-review-option { padding: 2px 0; color: var(--muted); }
+    .quiz-review-option.correct { color: var(--ok); font-weight: 600; }
+    .quiz-review-option.wrong { color: var(--err); }
+    .quiz-review-note { margin-top: 6px; font-size: .85rem; color: var(--muted); }
     .hidden { display: none; }
   </style>
 </head>
@@ -141,12 +168,38 @@
         </details>
       </div>
     </div>
+
+    <div class="card hidden" id="quizCard">
+      <label for="quizCount">3. Generate a quiz</label>
+      <div class="quiz-row">
+        <input type="number" id="quizCount" min="1" max="15" value="5" />
+        <button id="quizBtn">Generate quiz</button>
+      </div>
+      <div id="quizStatus" class="status"></div>
+      <div id="quizBox" class="hidden">
+        <div id="quizProgress" class="quiz-progress"></div>
+        <div id="quizQuestion" class="quiz-question"></div>
+        <div id="quizOptions"></div>
+        <div class="quiz-nav">
+          <button id="quizPrev" class="secondary">Previous</button>
+          <button id="quizNext" class="secondary">Next</button>
+          <button id="quizSubmit">Submit answers</button>
+        </div>
+      </div>
+      <div id="quizResultBox" class="hidden">
+        <div id="quizScore" class="answer"></div>
+        <div id="quizReview"></div>
+      </div>
+    </div>
   </div>
 
   <script>
     const API = "";
     let documentId = null;
     let token = null;
+    let quiz = null;
+    let quizIndex = 0;
+    let quizSelections = [];
 
     const $ = (id) => document.getElementById(id);
 
@@ -169,9 +222,12 @@
     function requireLogin(message) {
       token = null;
       documentId = null;
+      quiz = null;
+      quizSelections = [];
       $("authCard").classList.remove("hidden");
       $("uploadCard").classList.add("hidden");
       $("askCard").classList.add("hidden");
+      $("quizCard").classList.add("hidden");
       setStatus($("authStatus"), message || "Please sign in.", "error");
     }
 
@@ -258,6 +314,7 @@
         info.textContent = `📄 ${data.filename} — ${data.pages} page(s), ${data.chunks} chunk(s), ${data.characters} characters`;
         info.classList.remove("hidden");
         $("askCard").classList.remove("hidden");
+        $("quizCard").classList.remove("hidden");
       } catch (err) {
         setStatus(statusEl, "Network error while uploading.", "error");
       } finally {
@@ -389,6 +446,190 @@
         setStatus(statusEl, "Network error while summarizing.", "error");
       } finally {
         $("summarizeBtn").disabled = false;
+      }
+    });
+
+    function renderQuizQuestion() {
+      const question = quiz.questions[quizIndex];
+      $("quizProgress").textContent =
+        "Question " + (quizIndex + 1) + " of " + quiz.questions.length;
+
+      $("quizQuestion").textContent = question.question;
+
+      const optionsEl = $("quizOptions");
+      optionsEl.innerHTML = "";
+      question.options.forEach((option, i) => {
+        const label = document.createElement("label");
+        label.className = "quiz-option";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = "quizOption";
+        input.value = String(i);
+        input.checked = quizSelections[quizIndex] === i;
+        input.addEventListener("change", () => {
+          quizSelections[quizIndex] = i;
+        });
+        const span = document.createElement("span");
+        span.textContent = option;
+        label.appendChild(input);
+        label.appendChild(span);
+        optionsEl.appendChild(label);
+      });
+
+      $("quizPrev").disabled = quizIndex === 0;
+      $("quizNext").disabled = quizIndex === quiz.questions.length - 1;
+    }
+
+    function renderQuizResult(data) {
+      const score = data.score || {};
+      $("quizScore").textContent =
+        "You scored " + score.correct + " out of " + score.total +
+        " (" + score.percent + "%).";
+
+      const review = $("quizReview");
+      review.innerHTML = "";
+      (data.results || []).forEach((result) => {
+        const item = document.createElement("div");
+        item.className = "quiz-review-item";
+
+        const head = document.createElement("div");
+        head.className = "quiz-review-q";
+        head.textContent = (result.index + 1) + ". " + result.question;
+        item.appendChild(head);
+
+        result.options.forEach((option, i) => {
+          const line = document.createElement("div");
+          line.className = "quiz-review-option";
+          let suffix = "";
+          if (i === result.correct_index) {
+            line.classList.add("correct");
+            suffix = "  (correct answer)";
+          } else if (i === result.selected_index) {
+            line.classList.add("wrong");
+            suffix = "  (your answer)";
+          }
+          line.textContent = option + suffix;
+          item.appendChild(line);
+        });
+
+        const note = document.createElement("div");
+        note.className = "quiz-review-note";
+        const pageLabel =
+          result.page === null || result.page === undefined
+            ? "page unavailable"
+            : "page " + result.page;
+        note.textContent =
+          (result.explanation ? result.explanation + " " : "") +
+          "(source: " + pageLabel + ")";
+        item.appendChild(note);
+
+        review.appendChild(item);
+      });
+    }
+
+    $("quizBtn").addEventListener("click", async () => {
+      const statusEl = $("quizStatus");
+      $("quizBox").classList.add("hidden");
+      $("quizResultBox").classList.add("hidden");
+
+      if (!documentId) {
+        setStatus(statusEl, "Upload a document first.", "error");
+        return;
+      }
+      const count = parseInt($("quizCount").value, 10);
+      if (!count || count < 1 || count > 15) {
+        setStatus(statusEl, "Choose between 1 and 15 questions.", "error");
+        return;
+      }
+
+      $("quizBtn").disabled = true;
+      setStatus(statusEl, "Generating quiz…", "");
+
+      try {
+        const res = await fetch(API + `/documents/${documentId}/quiz`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ count }),
+        });
+        const data = await res.json();
+        if (res.status === 401) {
+          requireLogin("Your session expired. Please sign in again.");
+          return;
+        }
+        if (!res.ok) {
+          setStatus(statusEl, data.detail || "Could not generate a quiz.", "error");
+          return;
+        }
+        if (!data.questions || !data.questions.length) {
+          setStatus(statusEl, "No questions were generated.", "error");
+          return;
+        }
+
+        quiz = data;
+        quizIndex = 0;
+        quizSelections = new Array(data.questions.length).fill(null);
+        setStatus(
+          statusEl,
+          data.truncated
+            ? "Quiz generated from a sample of this large document."
+            : "Quiz generated.",
+          "ok"
+        );
+        renderQuizQuestion();
+        $("quizBox").classList.remove("hidden");
+      } catch (err) {
+        setStatus(statusEl, "Network error while generating the quiz.", "error");
+      } finally {
+        $("quizBtn").disabled = false;
+      }
+    });
+
+    $("quizPrev").addEventListener("click", () => {
+      if (quiz && quizIndex > 0) {
+        quizIndex -= 1;
+        renderQuizQuestion();
+      }
+    });
+
+    $("quizNext").addEventListener("click", () => {
+      if (quiz && quizIndex < quiz.questions.length - 1) {
+        quizIndex += 1;
+        renderQuizQuestion();
+      }
+    });
+
+    $("quizSubmit").addEventListener("click", async () => {
+      if (!quiz) return;
+      const statusEl = $("quizStatus");
+      $("quizSubmit").disabled = true;
+      setStatus(statusEl, "Scoring…", "");
+
+      try {
+        const res = await fetch(
+          API + `/documents/${documentId}/quiz/${quiz.quiz_id}/submit`,
+          {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ answers: quizSelections }),
+          }
+        );
+        const data = await res.json();
+        if (res.status === 401) {
+          requireLogin("Your session expired. Please sign in again.");
+          return;
+        }
+        if (!res.ok) {
+          setStatus(statusEl, data.detail || "Could not score the quiz.", "error");
+          return;
+        }
+        setStatus(statusEl, "", "");
+        $("quizBox").classList.add("hidden");
+        renderQuizResult(data);
+        $("quizResultBox").classList.remove("hidden");
+      } catch (err) {
+        setStatus(statusEl, "Network error while scoring the quiz.", "error");
+      } finally {
+        $("quizSubmit").disabled = false;
       }
     });
 
