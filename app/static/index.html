@@ -302,7 +302,16 @@
           data.sources.forEach((s, i) => {
             const div = document.createElement("div");
             div.className = "source";
-            div.textContent = `[${i + 1}] ${s}`;
+            if (s && typeof s === "object") {
+              const pageLabel =
+                s.page === null || s.page === undefined
+                  ? "page unavailable"
+                  : `page ${s.page}`;
+              const name = s.filename ? `${s.filename} — ` : "";
+              div.textContent = `[${i + 1}] ${name}${pageLabel}: ${s.text}`;
+            } else {
+              div.textContent = `[${i + 1}] ${s}`;
+            }
             sourcesEl.appendChild(div);
           });
           $("sourcesBox").classList.remove("hidden");

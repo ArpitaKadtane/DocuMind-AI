@@ -111,3 +111,19 @@ def make_pdf():
         return doc.tobytes()
 
     return _make
+
+
+@pytest.fixture
+def make_multipage_pdf():
+    """Return a helper that builds a PDF from a list of pages (each a line list)."""
+    import pymupdf
+
+    def _make(pages: list[list[str]]) -> bytes:
+        doc = pymupdf.open()
+        for lines in pages:
+            page = doc.new_page()
+            for i, line in enumerate(lines):
+                page.insert_text((72, 72 + i * 20), line)
+        return doc.tobytes()
+
+    return _make

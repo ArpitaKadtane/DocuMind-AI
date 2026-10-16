@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id TEXT NOT NULL,
     ordinal     INTEGER NOT NULL,
     text        TEXT NOT NULL,
+    page        INTEGER,
     embedding   BLOB NOT NULL,
     PRIMARY KEY (document_id, ordinal),
     FOREIGN KEY (document_id) REFERENCES documents(document_id)
@@ -110,6 +111,15 @@ class DocumentStore:
             "CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id)"
         )
 
+        # Page tracking was added later. Older databases have chunks without a
+        # page column; add it so page numbers can be stored from now on. Legacy
+        # rows keep a NULL page ("page unavailable") -- nothing is deleted.
+        chunk_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(chunks)")
+        }
+        if "page" not in chunk_columns:
+            conn.execute("ALTER TABLE chunks ADD COLUMN page INTEGER")
+
     # --- documents -------------------------------------------------------
 
     def stored_file_path(self, document_id: str) -> Path:
@@ -129,8 +139,13 @@ class DocumentStore:
         embedding_model: str,
         created_at: str,
         owner_id: str | None = None,
+        chunk_pages: list[int | None] | None = None,
     ) -> None:
-        """Persist a document's file, metadata, chunks, and embeddings."""
+        """Persist a document's file, metadata, chunks, and embeddings.
+
+        ``chunk_pages`` is an optional list parallel to ``chunks`` holding each
+        chunk's one-based source page (or ``None`` when unknown).
+        """
         target = self.stored_file_path(document_id)
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_bytes(stored_bytes)
@@ -167,18 +182,27 @@ class DocumentStore:
             )
             conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             if chunks and embeddings is not None:
+                if chunk_pages is None:
+                    chunk_pages = [None] * len(chunks)
+                elif len(chunk_pages) != len(chunks):
+                    raise ValueError(
+                        "Number of pages does not match number of chunks."
+                    )
                 rows = [
                     (
                         document_id,
                         ordinal,
                         text,
+                        page,
                         np.asarray(vector, dtype="float32").tobytes(),
                     )
-                    for ordinal, (text, vector) in enumerate(zip(chunks, embeddings))
+                    for ordinal, (text, vector, page) in enumerate(
+                        zip(chunks, embeddings, chunk_pages)
+                    )
                 ]
                 conn.executemany(
-                    "INSERT INTO chunks (document_id, ordinal, text, embedding) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO chunks (document_id, ordinal, text, page, embedding) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     rows,
                 )
 
@@ -218,21 +242,33 @@ class DocumentStore:
             )
         return int(cursor.rowcount)
 
-    def load_chunks(self, document_id: str) -> tuple[list[str], np.ndarray]:
-        """Return ``(chunks, embeddings)`` for a document, in stored order."""
+    def load_chunks_with_pages(
+        self, document_id: str
+    ) -> tuple[list[str], np.ndarray, list[int | None]]:
+        """Return ``(chunks, embeddings, pages)`` for a document, in stored order.
+
+        ``pages`` runs parallel to ``chunks``; a ``None`` entry means the page
+        is unknown (for example a document stored before page tracking existed).
+        """
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT text, embedding FROM chunks "
+                "SELECT text, page, embedding FROM chunks "
                 "WHERE document_id = ? ORDER BY ordinal",
                 (document_id,),
             ).fetchall()
 
         chunks = [row["text"] for row in rows]
+        pages = [row["page"] for row in rows]
         if rows:
             vectors = [np.frombuffer(row["embedding"], dtype="float32") for row in rows]
             embeddings = np.vstack(vectors).astype("float32")
         else:
             embeddings = np.zeros((0, 0), dtype="float32")
+        return chunks, embeddings, pages
+
+    def load_chunks(self, document_id: str) -> tuple[list[str], np.ndarray]:
+        """Return ``(chunks, embeddings)`` for a document, in stored order."""
+        chunks, embeddings, _ = self.load_chunks_with_pages(document_id)
         return chunks, embeddings
 
     def count(self) -> int:

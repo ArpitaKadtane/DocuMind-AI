@@ -119,7 +119,11 @@ def test_documents_restored_and_searchable_after_restart(
     monkeypatch.setattr(
         main,
         "answer_question",
-        lambda q, s: {"answer": "5000 credits", "found": True, "sources": ["ctx"]},
+        lambda q, s, filename=None: {
+            "answer": "5000 credits",
+            "found": True,
+            "sources": ["ctx"],
+        },
     )
     ask = auth_client.post(
         f"/documents/{document_id}/ask", json={"question": "What is the budget?"}

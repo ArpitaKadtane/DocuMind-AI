@@ -72,3 +72,21 @@ def chunk_text(
         chunks.append(" ".join(current).strip())
 
     return [c for c in chunks if c]
+
+
+def chunk_pages(
+    pages: list[tuple[int, str]],
+    chunk_size: int = CHUNK_SIZE_CHARS,
+    overlap: int = CHUNK_OVERLAP_CHARS,
+) -> list[dict]:
+    """Chunk each page separately and remember each chunk's source page.
+
+    Chunking page by page guarantees every chunk maps to exactly one page, so a
+    citation is never ambiguous. ``pages`` is a list of ``(page_number, text)``
+    with one-based page numbers. Returns a list of ``{"text": str, "page": int}``.
+    """
+    records: list[dict] = []
+    for page_number, page_text in pages:
+        for chunk in chunk_text(page_text, chunk_size=chunk_size, overlap=overlap):
+            records.append({"text": chunk, "page": page_number})
+    return records

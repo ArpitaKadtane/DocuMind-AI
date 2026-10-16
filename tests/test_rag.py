@@ -60,17 +60,42 @@ def test_high_score_calls_llm_and_returns_answer(monkeypatch):
         return "The budget is 5000 credits."
 
     monkeypatch.setattr(rag, "generate_answer", fake_answer)
-    store = StubStore(results=[{"text": "The budget is 5000 credits.", "score": 0.8}])
-    result = rag.answer_question("What is the budget?", store)
+    store = StubStore(
+        results=[{"text": "The budget is 5000 credits.", "score": 0.8, "page": 2}]
+    )
+    result = rag.answer_question("What is the budget?", store, filename="budget.pdf")
 
     assert result["found"] is True
     assert result["answer"] == "The budget is 5000 credits."
-    assert captured["contexts"] == ["The budget is 5000 credits."]
+    assert captured["contexts"] == ["[page 2] The budget is 5000 credits."]
+    assert result["sources"] == [
+        {
+            "filename": "budget.pdf",
+            "page": 2,
+            "text": "The budget is 5000 credits.",
+            "score": 0.8,
+        }
+    ]
+
+
+def test_missing_page_is_reported_as_unavailable(monkeypatch):
+    captured = {}
+
+    def fake_answer(question, contexts):
+        captured["contexts"] = contexts
+        return "Some answer."
+
+    monkeypatch.setattr(rag, "generate_answer", fake_answer)
+    store = StubStore(results=[{"text": "legacy text", "score": 0.9}])
+    result = rag.answer_question("question", store, filename="legacy.pdf")
+
+    assert captured["contexts"] == ["[page unavailable] legacy text"]
+    assert result["sources"][0]["page"] is None
 
 
 def test_llm_saying_not_found_marks_found_false(monkeypatch):
     monkeypatch.setattr(rag, "generate_answer", lambda q, c: NOT_FOUND_MESSAGE)
-    store = StubStore(results=[{"text": "some text", "score": 0.9}])
+    store = StubStore(results=[{"text": "some text", "score": 0.9, "page": 1}])
     result = rag.answer_question("unanswerable", store)
 
     assert result["found"] is False

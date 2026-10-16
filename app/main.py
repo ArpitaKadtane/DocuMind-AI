@@ -11,14 +11,14 @@ from pydantic import BaseModel, Field
 
 from app.auth import get_current_user
 from app.auth import router as auth_router
-from app.chunking import chunk_text
+from app.chunking import chunk_pages
 from app.config import settings
 from app.embeddings import embed_texts
 from app.llm import LLMError
 from app.pdf_processor import (
     MAX_UPLOAD_MB,
     PDFValidationError,
-    extract_text_from_pdf,
+    extract_pages_from_pdf,
     _max_bytes,
 )
 from app.rag import answer_question
@@ -89,16 +89,17 @@ def load_persisted_documents(store: DocumentStore | None = None) -> int:
                     "data from the database only",
                     document_id,
                 )
-            chunks, embeddings = store.load_chunks(document_id)
+            chunks, embeddings, chunk_pages = store.load_chunks_with_pages(document_id)
             vector_store = VectorStore()
             if chunks:
-                vector_store.add(chunks, embeddings)
+                vector_store.add(chunks, embeddings, pages=chunk_pages)
             DOCUMENTS[document_id] = {
                 "filename": meta["filename"],
                 "owner_id": meta.get("owner_id"),
                 "pages": meta["pages"],
                 "characters": meta["characters"],
                 "chunks": chunks,
+                "chunk_pages": chunk_pages,
                 "store": vector_store,
                 "created_at": meta["created_at"],
             }
@@ -220,19 +221,22 @@ async def upload_document(
         )
 
     try:
-        text, page_count = extract_text_from_pdf(data)
+        pages, page_count = extract_pages_from_pdf(data)
     except PDFValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     document_id = uuid.uuid4().hex
     filename = os.path.basename(file.filename or "upload.pdf")
-    chunks = chunk_text(text)
+    text = "\n\n".join(page_text for _, page_text in pages).strip()
+    chunk_records = chunk_pages(pages)
+    chunks = [record["text"] for record in chunk_records]
+    chunk_page_numbers = [record["page"] for record in chunk_records]
     embeddings = embed_texts(chunks) if chunks else None
     created_at = datetime.now(timezone.utc).isoformat()
 
     vector_store = VectorStore()
     if chunks and embeddings is not None:
-        vector_store.add(chunks, embeddings)
+        vector_store.add(chunks, embeddings, pages=chunk_page_numbers)
 
     DOCUMENTS[document_id] = {
         "filename": filename,
@@ -240,6 +244,7 @@ async def upload_document(
         "pages": page_count,
         "characters": len(text),
         "chunks": chunks,
+        "chunk_pages": chunk_page_numbers,
         "store": vector_store,
         "created_at": created_at,
     }
@@ -258,6 +263,7 @@ async def upload_document(
             embedding_model=settings.embedding_model,
             created_at=created_at,
             owner_id=user["user_id"],
+            chunk_pages=chunk_page_numbers,
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Could not persist document id=%s: %s", document_id, exc)
@@ -297,7 +303,17 @@ def search_document(
     top_k = max(1, min(top_k, 10))
     query_vector = embed_texts([query])[0]
     matches = doc["store"].search(query_vector, top_k=top_k)
-    return {"document_id": document_id, "query": query, "matches": matches}
+    # Enrich each hit with the source filename and page so callers can cite it.
+    sources = [
+        {
+            "filename": doc["filename"],
+            "page": match.get("page"),
+            "text": match["text"],
+            "score": match["score"],
+        }
+        for match in matches
+    ]
+    return {"document_id": document_id, "query": query, "matches": sources}
 
 
 @app.post("/documents/{document_id}/ask")
@@ -312,7 +328,7 @@ def ask_document(
         raise HTTPException(status_code=400, detail="Question must not be empty.")
 
     try:
-        result = answer_question(question, doc["store"])
+        result = answer_question(question, doc["store"], filename=doc["filename"])
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

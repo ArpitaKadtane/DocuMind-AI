@@ -34,10 +34,12 @@ def validate_pdf_bytes(data: bytes) -> None:
         raise PDFValidationError("File is not a valid PDF (missing %PDF header).")
 
 
-def extract_text_from_pdf(data: bytes) -> tuple[str, int]:
-    """Return ``(text, page_count)`` for a PDF.
+def extract_pages_from_pdf(data: bytes) -> tuple[list[tuple[int, str]], int]:
+    """Return ``([(page_number, text), ...], page_count)`` for a PDF.
 
-    Raises PDFValidationError with a safe, user-facing message on any problem.
+    Page numbers are the original one-based PDF page numbers, so a chunk can be
+    traced back to the exact page it came from. Raises PDFValidationError with a
+    safe, user-facing message on any problem.
     """
     validate_pdf_bytes(data)
 
@@ -54,14 +56,14 @@ def extract_text_from_pdf(data: bytes) -> tuple[str, int]:
                     f"PDF has {page_count} pages; the limit is {MAX_PAGES}."
                 )
 
-            parts: list[str] = []
+            pages: list[tuple[int, str]] = []
             total = 0
-            for page in doc:
-                text = page.get_text("text")
-                total += len(text)
+            for page_number, page in enumerate(doc, start=1):
+                page_text = page.get_text("text")
+                total += len(page_text)
                 if total > MAX_TOTAL_CHARS:
                     raise PDFValidationError("PDF text exceeds the allowed limit.")
-                parts.append(text)
+                pages.append((page_number, page_text))
     except PDFValidationError:
         raise
     except Exception as exc:
@@ -69,9 +71,19 @@ def extract_text_from_pdf(data: bytes) -> tuple[str, int]:
             "PDF could not be read; it may be corrupted or malicious."
         ) from exc
 
-    text = "\n\n".join(parts).strip()
-    if not text:
+    if not any(page_text.strip() for _, page_text in pages):
         raise PDFValidationError(
             "No text could be extracted. Scanned/image-only PDFs are not supported."
         )
+    return pages, page_count
+
+
+def extract_text_from_pdf(data: bytes) -> tuple[str, int]:
+    """Return ``(text, page_count)`` for a PDF, with all pages joined.
+
+    Page breaks are represented by a blank line. Use ``extract_pages_from_pdf``
+    when you need per-page text (for example, to cite page numbers).
+    """
+    pages, page_count = extract_pages_from_pdf(data)
+    text = "\n\n".join(page_text for _, page_text in pages).strip()
     return text, page_count

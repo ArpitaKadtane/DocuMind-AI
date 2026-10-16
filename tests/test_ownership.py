@@ -49,7 +49,11 @@ def test_owner_can_access_own_document(auth_client, make_pdf, monkeypatch):
     monkeypatch.setattr(
         main,
         "answer_question",
-        lambda q, s: {"answer": "5000 credits", "found": True, "sources": ["ctx"]},
+        lambda q, s, filename=None: {
+            "answer": "5000 credits",
+            "found": True,
+            "sources": ["ctx"],
+        },
     )
     assert (
         auth_client.post(

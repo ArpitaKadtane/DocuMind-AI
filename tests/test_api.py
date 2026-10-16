@@ -78,7 +78,11 @@ def test_ask_success(auth_client, make_pdf, monkeypatch):
     ]
     monkeypatch.setattr(
         "app.main.answer_question",
-        lambda q, store: {"answer": "5000 credits", "found": True, "sources": ["ctx"]},
+        lambda q, store, filename=None: {
+            "answer": "5000 credits",
+            "found": True,
+            "sources": ["ctx"],
+        },
     )
     response = auth_client.post(
         f"/documents/{document_id}/ask", json={"question": "What is the budget?"}
@@ -94,7 +98,7 @@ def test_ask_returns_502_on_llm_error(auth_client, make_pdf, monkeypatch):
         "document_id"
     ]
 
-    def boom(q, store):
+    def boom(q, store, filename=None):
         raise LLMError("LLM unreachable")
 
     monkeypatch.setattr("app.main.answer_question", boom)
