@@ -81,14 +81,14 @@ def test_stored_filename_is_generated_not_user_supplied(tmp_path):
 
 
 def test_documents_restored_and_searchable_after_restart(
-    client, make_pdf, monkeypatch, tmp_path
+    auth_client, make_pdf, monkeypatch
 ):
-    store = DocumentStore(tmp_path / "data")
-    monkeypatch.setattr(main, "DOCUMENT_STORE", store)
+    # The autouse "isolated_storage" fixture already points the app at a
+    # throwaway directory, so users, sessions, and documents all live there.
     main.DOCUMENTS.clear()
 
     pdf = make_pdf(["The budget is 5000 credits"])
-    upload = client.post(
+    upload = auth_client.post(
         "/documents", files={"file": ("doc.pdf", pdf, "application/pdf")}
     )
     assert upload.status_code == 200
@@ -96,18 +96,22 @@ def test_documents_restored_and_searchable_after_restart(
 
     # Simulate a server restart: drop the in-memory cache and reload from disk.
     main.DOCUMENTS.clear()
-    restored = main.load_persisted_documents(store=store)
+    restored = main.load_persisted_documents()
     assert restored == 1
     assert document_id in main.DOCUMENTS
+    # Ownership survives the restart, so the uploader can still reach it.
+    assert main.DOCUMENTS[document_id]["owner_id"] == main.get_document_store().get_document(
+        document_id
+    )["owner_id"]
 
     # Metadata survives the restart.
-    meta = client.get(f"/documents/{document_id}")
+    meta = auth_client.get(f"/documents/{document_id}")
     assert meta.status_code == 200
     assert meta.json()["chunks"] >= 1
     assert meta.json()["filename"] == "doc.pdf"
 
     # Search works against the restored index.
-    search = client.post(f"/documents/{document_id}/search?query=budget")
+    search = auth_client.post(f"/documents/{document_id}/search?query=budget")
     assert search.status_code == 200
     assert len(search.json()["matches"]) >= 1
 
@@ -117,11 +121,39 @@ def test_documents_restored_and_searchable_after_restart(
         "answer_question",
         lambda q, s: {"answer": "5000 credits", "found": True, "sources": ["ctx"]},
     )
-    ask = client.post(
+    ask = auth_client.post(
         f"/documents/{document_id}/ask", json={"question": "What is the budget?"}
     )
     assert ask.status_code == 200
     assert ask.json()["found"] is True
+
+
+def test_owner_id_column_is_added_to_legacy_database(tmp_path):
+    """A database created before auth existed must be migrated in place."""
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    db_path = legacy_dir / "documents.sqlite3"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE documents (document_id TEXT PRIMARY KEY, "
+            "filename TEXT NOT NULL, stored_filename TEXT NOT NULL, "
+            "size_bytes INTEGER NOT NULL, pages INTEGER, characters INTEGER "
+            "NOT NULL, chunk_count INTEGER NOT NULL, embedding_model TEXT, "
+            "embedding_dim INTEGER, created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO documents VALUES "
+            "('old','a.pdf','old.pdf',3,1,3,1,'m',3,'2026-01-01T00:00:00+00:00')"
+        )
+
+    store = DocumentStore(legacy_dir)
+
+    # The migration adds the column; the pre-existing row is left unowned.
+    document = store.get_document("old")
+    assert document is not None
+    assert document["owner_id"] is None
+    assert store.iter_documents(owner_id="nobody") == []
 
 
 def test_missing_stored_file_still_restores_search(tmp_path, caplog):

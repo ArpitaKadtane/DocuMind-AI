@@ -5,10 +5,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from app.auth import get_current_user
+from app.auth import router as auth_router
 from app.chunking import chunk_text
 from app.config import settings
 from app.embeddings import embed_texts
@@ -93,6 +95,7 @@ def load_persisted_documents(store: DocumentStore | None = None) -> int:
                 vector_store.add(chunks, embeddings)
             DOCUMENTS[document_id] = {
                 "filename": meta["filename"],
+                "owner_id": meta.get("owner_id"),
                 "pages": meta["pages"],
                 "characters": meta["characters"],
                 "chunks": chunks,
@@ -114,10 +117,27 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="GenAI Document Assistant", lifespan=lifespan)
+app.include_router(auth_router)
 
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000)
+
+
+def get_owned_document(
+    document_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Return a document only if it belongs to the authenticated user.
+
+    A document that does not exist and one owned by someone else raise the same
+    404 with the same message, so a caller cannot tell whether an id exists.
+    Unowned legacy documents (owner_id is None) are inaccessible this way.
+    """
+    doc = DOCUMENTS.get(document_id)
+    if doc is None or doc.get("owner_id") != user["user_id"]:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return doc
 
 
 @app.middleware("http")
@@ -154,8 +174,30 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/documents")
+def list_documents(user: dict = Depends(get_current_user)):
+    """List metadata for the current user's documents (never file paths/text)."""
+    owned = [
+        {
+            "document_id": document_id,
+            "filename": doc["filename"],
+            "pages": doc["pages"],
+            "characters": doc["characters"],
+            "chunks": len(doc["chunks"]),
+            "created_at": doc["created_at"],
+        }
+        for document_id, doc in DOCUMENTS.items()
+        if doc.get("owner_id") == user["user_id"]
+    ]
+    owned.sort(key=lambda item: item["created_at"])
+    return {"documents": owned}
+
+
 @app.post("/documents")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
     """Accept a PDF, validate it, extract text, and register it for Q&A."""
     content_length = file.size
     if content_length is not None and content_length > MAX_UPLOAD_BYTES:
@@ -194,6 +236,7 @@ async def upload_document(file: UploadFile = File(...)):
 
     DOCUMENTS[document_id] = {
         "filename": filename,
+        "owner_id": user["user_id"],
         "pages": page_count,
         "characters": len(text),
         "chunks": chunks,
@@ -214,6 +257,7 @@ async def upload_document(file: UploadFile = File(...)):
             embeddings=embeddings,
             embedding_model=settings.embedding_model,
             created_at=created_at,
+            owner_id=user["user_id"],
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Could not persist document id=%s: %s", document_id, exc)
@@ -238,11 +282,13 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.post("/documents/{document_id}/search")
-def search_document(document_id: str, query: str, top_k: int | None = None):
+def search_document(
+    document_id: str,
+    query: str,
+    top_k: int | None = None,
+    doc: dict = Depends(get_owned_document),
+):
     """Debug/retrieval endpoint: return the most relevant chunks for a query."""
-    doc = DOCUMENTS.get(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found.")
     if not query.strip():
         raise HTTPException(status_code=400, detail="Query must not be empty.")
 
@@ -255,12 +301,12 @@ def search_document(document_id: str, query: str, top_k: int | None = None):
 
 
 @app.post("/documents/{document_id}/ask")
-def ask_document(document_id: str, payload: AskRequest):
+def ask_document(
+    document_id: str,
+    payload: AskRequest,
+    doc: dict = Depends(get_owned_document),
+):
     """Answer a question about an uploaded document using RAG."""
-    doc = DOCUMENTS.get(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found.")
-
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question must not be empty.")
@@ -282,10 +328,7 @@ def ask_document(document_id: str, payload: AskRequest):
 
 
 @app.get("/documents/{document_id}")
-def get_document_meta(document_id: str):
-    doc = DOCUMENTS.get(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found.")
+def get_document_meta(document_id: str, doc: dict = Depends(get_owned_document)):
     return {
         "document_id": document_id,
         "filename": doc["filename"],

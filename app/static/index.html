@@ -38,7 +38,7 @@
     }
     label { display: block; font-weight: 600; margin-bottom: 8px; }
     input[type="file"] { margin-bottom: 12px; }
-    input[type="text"] {
+    input[type="text"], input[type="password"] {
       width: 100%;
       padding: 10px 12px;
       border: 1px solid #d1d5db;
@@ -46,6 +46,9 @@
       font-size: 1rem;
       margin-bottom: 12px;
     }
+    button + button { margin-left: 8px; }
+    button.secondary { background: #e5e7eb; color: var(--text); }
+    button.secondary:hover { background: #d1d5db; }
     button {
       background: var(--accent);
       color: #fff;
@@ -95,7 +98,16 @@
     <h1>GenAI Document Assistant</h1>
     <p class="subtitle">Upload a PDF, then ask questions grounded in its contents.</p>
 
-    <div class="card">
+    <div class="card" id="authCard">
+      <label for="email">Sign in</label>
+      <input type="text" id="email" placeholder="you@example.com" autocomplete="username" />
+      <input type="password" id="password" placeholder="Password (min 8 characters)" autocomplete="current-password" />
+      <button id="loginBtn">Log in</button>
+      <button id="registerBtn" class="secondary">Create account</button>
+      <div id="authStatus" class="status"></div>
+    </div>
+
+    <div class="card hidden" id="uploadCard">
       <label for="file">1. Upload a PDF</label>
       <input type="file" id="file" accept="application/pdf" />
       <button id="uploadBtn">Upload</button>
@@ -122,6 +134,7 @@
   <script>
     const API = "";
     let documentId = null;
+    let token = null;
 
     const $ = (id) => document.getElementById(id);
 
@@ -129,6 +142,72 @@
       el.textContent = message;
       el.className = "status" + (type ? " " + type : "");
     }
+
+    function authHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      if (token) headers["Authorization"] = "Bearer " + token;
+      return headers;
+    }
+
+    function showApp() {
+      $("authCard").classList.add("hidden");
+      $("uploadCard").classList.remove("hidden");
+    }
+
+    function requireLogin(message) {
+      token = null;
+      documentId = null;
+      $("authCard").classList.remove("hidden");
+      $("uploadCard").classList.add("hidden");
+      $("askCard").classList.add("hidden");
+      setStatus($("authStatus"), message || "Please sign in.", "error");
+    }
+
+    async function authenticate(path, email, password) {
+      const res = await fetch(API + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Authentication failed.");
+      return data;
+    }
+
+    $("loginBtn").addEventListener("click", async () => {
+      const email = $("email").value.trim();
+      const password = $("password").value;
+      if (!email || !password) {
+        setStatus($("authStatus"), "Enter your email and password.", "error");
+        return;
+      }
+      try {
+        const data = await authenticate("/auth/login", email, password);
+        token = data.access_token;
+        setStatus($("authStatus"), "", "");
+        showApp();
+      } catch (err) {
+        setStatus($("authStatus"), err.message, "error");
+      }
+    });
+
+    $("registerBtn").addEventListener("click", async () => {
+      const email = $("email").value.trim();
+      const password = $("password").value;
+      if (!email || !password) {
+        setStatus($("authStatus"), "Enter an email and a password (min 8 characters).", "error");
+        return;
+      }
+      try {
+        await authenticate("/auth/register", email, password);
+        const data = await authenticate("/auth/login", email, password);
+        token = data.access_token;
+        setStatus($("authStatus"), "", "");
+        showApp();
+      } catch (err) {
+        setStatus($("authStatus"), err.message, "error");
+      }
+    });
 
     $("uploadBtn").addEventListener("click", async () => {
       const fileInput = $("file");
@@ -147,8 +226,16 @@
       setStatus(statusEl, "Uploading and processing…", "");
 
       try {
-        const res = await fetch(API + "/documents", { method: "POST", body: form });
+        const res = await fetch(API + "/documents", {
+          method: "POST",
+          headers: authHeaders(),
+          body: form,
+        });
         const data = await res.json();
+        if (res.status === 401) {
+          requireLogin("Your session expired. Please sign in again.");
+          return;
+        }
         if (!res.ok) {
           setStatus(statusEl, data.detail || "Upload failed.", "error");
           return;
@@ -187,10 +274,14 @@
       try {
         const res = await fetch(API + `/documents/${documentId}/ask`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ question }),
         });
         const data = await res.json();
+        if (res.status === 401) {
+          requireLogin("Your session expired. Please sign in again.");
+          return;
+        }
         if (!res.ok) {
           setStatus(statusEl, data.detail || "Request failed.", "error");
           return;

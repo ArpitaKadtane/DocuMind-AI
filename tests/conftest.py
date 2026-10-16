@@ -66,6 +66,39 @@ def client():
 
 
 @pytest.fixture
+def make_auth_client():
+    """Factory returning a TestClient already authenticated as a new user.
+
+    Each call registers and logs in a distinct email and sets the bearer token
+    on the client, so tests can act as several independent users.
+    """
+    from fastapi.testclient import TestClient
+
+    def _make(email: str, password: str = "password123", register: bool = True):
+        test_client = TestClient(main.app)
+        if register:
+            created = test_client.post(
+                "/auth/register", json={"email": email, "password": password}
+            )
+            assert created.status_code == 201, created.text
+        logged_in = test_client.post(
+            "/auth/login", json={"email": email, "password": password}
+        )
+        assert logged_in.status_code == 200, logged_in.text
+        token = logged_in.json()["access_token"]
+        test_client.headers.update({"Authorization": f"Bearer {token}"})
+        return test_client
+
+    return _make
+
+
+@pytest.fixture
+def auth_client(make_auth_client):
+    """A single authenticated client for tests that do not need a second user."""
+    return make_auth_client("tester@example.com")
+
+
+@pytest.fixture
 def make_pdf():
     """Return a helper that builds an in-memory PDF from a list of lines."""
     import pymupdf

@@ -46,8 +46,9 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
 - 🚫 **Refuses to answer** when nothing relevant is found (score gate + prompt rule)
 - 🛡️ Prompt-injection defense: document text is treated as untrusted data
 - 💾 **Persistent storage** — uploaded PDFs, metadata, and search vectors are saved with SQLite and restored after a restart
+- 🔐 **Accounts & per-user ownership** — register/login with bearer tokens; users can only see and query their own documents
 - 🌐 Simple built-in web frontend (plain HTML/JS, no build step)
-- ✅ 40 automated tests that run offline in a few seconds
+- ✅ 71 automated tests that run offline in a few seconds
 
 ---
 
@@ -106,6 +107,7 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
 | LLM | Groq (`openai/gpt-oss-120b`) | Free tier, fast, OpenAI-compatible |
 | HTTP client | httpx 0.28 | Already required by the stack |
 | Config | python-dotenv 1.2 | Secrets stay in `.env` |
+| Auth | Standard library (`hashlib.scrypt`, `secrets`) | No new dependency; Python-3.14 safe |
 | Tests | pytest 9.1 + FastAPI TestClient | Fast, offline |
 
 ---
@@ -149,6 +151,7 @@ Copy `.env.example` to `.env` and fill in your values. **Never commit `.env`** (
 | `MIN_SCORE` | `0.15` | Below this similarity, the app answers "not found" without calling the LLM |
 | `TOP_K` | `4` | How many chunks to retrieve |
 | `DATA_DIR` | `./data` | Directory for stored PDFs and the SQLite database (created automatically) |
+| `SESSION_TTL_HOURS` | `168` | How long a login token stays valid (7 days) |
 | `CHUNK_SIZE_CHARS` | `800` | Max characters per chunk |
 | `CHUNK_OVERLAP_CHARS` | `150` | Overlap between chunks |
 | `MAX_UPLOAD_MB` | `10` | Upload size limit |
@@ -173,7 +176,7 @@ Open **http://127.0.0.1:8000/** for the web UI, or **http://127.0.0.1:8000/docs*
 Uploaded documents are **saved to disk** so they survive a server restart. On startup the app rebuilds its search index automatically.
 
 - **Location:** `data/` next to the `app/` package (override with `DATA_DIR`).
-  - `data/documents.sqlite3` — metadata, chunk text, and chunk embeddings.
+  - `data/documents.sqlite3` — documents, chunks, embeddings, **users**, and **sessions**.
   - `data/files/<document_id>.pdf` — the original PDF, stored under a generated name (the user-supplied filename is never used as a path).
 - **Startup restore:** the app reads the database and rebuilds each document's in-memory FAISS index from the stored vectors. No model download or re-embedding is needed.
 - **Resilience:** if a stored PDF or a single record is missing or corrupt, the app logs a warning and skips it instead of crashing. If a stored PDF is gone, search still works because the chunks and vectors live in the database.
@@ -191,27 +194,65 @@ The folder is recreated automatically on the next upload or startup.
 
 ---
 
+## Accounts & authentication
+
+Every user must **register** and **log in** before they can upload or query documents. Each document records an owner, so a user can only reach their own documents.
+
+- **Hashing:** passwords are hashed with `hashlib.scrypt` (memory-hard, standard library, ~16 MiB per hash) plus a fresh random salt. Nothing third-party to install and nothing stored in plaintext.
+- **Tokens:** login returns an opaque bearer token. Only its SHA-256 hash is stored in SQLite, so a database leak cannot be replayed as a live session. Tokens expire after `SESSION_TTL_HOURS`.
+- **Ownership:** `POST /documents` stamps the uploader's id; `GET/POST /documents/{id}*` check it. A document that doesn't exist and one owned by someone else return the **same 404**, so callers can't probe for valid ids.
+- **Legacy documents** (uploaded before accounts existed) have a NULL owner and are **inaccessible**. They are never deleted and never auto-assigned. An operator can claim them explicitly:
+  ```python
+  from app.storage import DocumentStore
+  store = DocumentStore("data")
+  store.claim_legacy_documents("<USER_ID>")
+  ```
+- **Standard flow:** `POST /auth/register` → `POST /auth/login` → send the token on every request as `Authorization: Bearer <token>` → `POST /auth/logout` to revoke.
+
+### Auth endpoints
+
+| Method | Path | Purpose | Auth |
+|---|---|---|---|
+| `POST` | `/auth/register` | Create an account (email + password) | — |
+| `POST` | `/auth/login` | Get a bearer token | — |
+| `POST` | `/auth/logout` | Revoke the current token | ✔ |
+| `GET` | `/auth/me` | Current user's profile | ✔ |
+
+---
+
 ## API endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/` | Web frontend |
-| `GET` | `/health` | Health check → `{"status":"ok"}` |
-| `POST` | `/documents` | Upload a PDF (`multipart/form-data`, field `file`) |
-| `GET` | `/documents/{id}` | Document metadata (not the text) |
-| `POST` | `/documents/{id}/search?query=…` | Raw retrieval — returns matched chunks + scores |
-| `POST` | `/documents/{id}/ask` | RAG Q&A — body: `{"question": "…"}` |
+| Method | Path | Purpose | Auth |
+|---|---|---|---|
+| `GET` | `/` | Web frontend | — |
+| `GET` | `/health` | Health check → `{"status":"ok"}` | — |
+| `POST` | `/auth/register` | Create an account | — |
+| `POST` | `/auth/login` | Get a bearer token | — |
+| `GET` | `/documents` | List the current user's documents | ✔ |
+| `POST` | `/documents` | Upload a PDF (`multipart/form-data`, field `file`) | ✔ |
+| `GET` | `/documents/{id}` | Document metadata (not the text) | ✔ |
+| `POST` | `/documents/{id}/search?query=…` | Raw retrieval — returns matched chunks + scores | ✔ |
+| `POST` | `/documents/{id}/ask` | RAG Q&A — body: `{"question": "…"}` | ✔ |
 
 **Example:**
 
 ```powershell
+$BASE = "http://127.0.0.1:8000"
+
+# Log in (after registering) to get a token
+$TOKEN = (Invoke-RestMethod -Method Post -Uri "$BASE/auth/login" `
+           -ContentType "application/json" `
+           -Body '{"email":"you@example.com","password":"password123"}').access_token
+$AUTH = @{ Authorization = "Bearer $TOKEN" }
+
 # Upload
-curl -F "file=@documents/sample.pdf;type=application/pdf" http://127.0.0.1:8000/documents
+Invoke-RestMethod -Uri "$BASE/documents" -Headers $AUTH -Method Post -Form @{
+  file = Get-Item "documents\sample.pdf"
+}
 
 # Ask
-curl -X POST -H "Content-Type: application/json" `
-     -d '{"question":"What is the budget?"}' `
-     http://127.0.0.1:8000/documents/<DOCUMENT_ID>/ask
+Invoke-RestMethod -Uri "$BASE/documents/<DOCUMENT_ID>/ask" -Headers $AUTH -Method Post `
+  -ContentType "application/json" -Body '{"question":"What is the budget?"}'
 ```
 
 Example answer:
@@ -248,7 +289,7 @@ Example answer:
 pytest
 ```
 
-The suite covers document processing, chunking, vector search, RAG gating, API behaviour, and persistence — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request) and restart restoration (missing files, corrupt records). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
+The suite covers document processing, chunking, vector search, RAG gating, API behaviour, persistence, and authentication/ownership — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request), restart restoration (missing files, corrupt records), and auth cases (unauthenticated requests, invalid tokens, logout, cross-user access, legacy documents, schema migration). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
 
 ---
 
@@ -263,10 +304,12 @@ DocumentAssistant/
 │   ├── chunking.py        # Sentence-aware chunking with overlap
 │   ├── embeddings.py      # Text → vectors (local model)
 │   ├── vector_store.py    # FAISS index wrapper
-│   ├── storage.py         # SQLite + file persistence (documents, chunks)
+│   ├── storage.py         # SQLite persistence (documents, chunks, users, sessions)
+│   ├── auth.py            # Registration, login, bearer-token auth
+│   ├── security.py        # scrypt password hashing + token helpers
 │   ├── llm.py             # Groq API call + grounding prompt
 │   ├── rag.py             # Retrieval → score gate → answer
-│   └── static/index.html  # Web frontend
+│   └── static/index.html  # Web frontend (with sign-in)
 ├── tests/                 # pytest suite (offline)
 ├── documents/             # Sample PDFs
 ├── data/                  # Runtime data: uploaded PDFs + SQLite DB (gitignored)
@@ -285,17 +328,22 @@ DocumentAssistant/
 - **Secrets live in `.env`** and are excluded from Git; the API key is only ever sent in an `Authorization` header (never logged or echoed).
 - **Logs contain metadata only** (document id, filename, page count, chunk count, found/not-found) — never document text, questions, answers, or keys.
 - **Prompt injection:** document text is wrapped in `<document_context>` tags and the system prompt marks it as untrusted data, so instructions embedded in a PDF are ignored.
-- A **request-size middleware** rejects oversized bodies before reading them, on top of the real size check while streaming the upload.
+- **A request-size middleware** rejects oversized bodies before reading them, on top of the real size check while streaming the upload.
+- **Per-user isolation:** every document endpoint is gated by ownership. A missing id and a foreign id return the identical 404, so ids can't be probed for existence.
+- **Password storage:** scrypt with a per-user salt; only scrypt hashes are stored. Login returns a generic "Incorrect email or password" for both unknown emails and wrong passwords, so accounts can't be enumerated.
+- **Token storage:** sessions persist only a SHA-256 hash of the bearer token, so a DB leak can't be replayed. Expired/unknown tokens are rejected and purged on use.
+- **Auth is standard-library only** — no extra crypto dependency to keep updated or audit for Python-version support.
 
 ---
 
 ## Limitations
 
-- **Local SQLite storage** — documents and their search indexes persist across restarts in `data/`, but everything runs on a single machine and users don't share documents. A real multi-user product would move to a database server plus object storage.
+- **Local SQLite storage** — documents and their search indexes persist across restarts in `data/`, but everything runs on a single machine. A real multi-user product would move to a database server plus object storage.
+- **Documents are private per user** — users don't share documents; sharing is a future feature.
 - **One document at a time** — each document gets its own index; there is no global corpus search.
 - **Scanned/image-only PDFs** are rejected because there is no OCR step.
 - **`MIN_SCORE` tuning** — thresholds depend on the embedding model. If legitimate questions are answered "not found", lower `MIN_SCORE`; if wrong answers appear, raise it.
-- **No user authentication** — anyone who can reach the server can upload/ask.
+- **No email verification or password reset** — sign-up is open; add those before any public deployment. No rate limiting on login yet (brute force is unmitigated).
 - **Free-tier Groq limits** — the model can change or be rate-limited; `GROQ_MODEL` is configurable for that reason. (`llama-3.3-70b-versatile` is now an Enterprise model and is **not** available on the free tier.)
 - **Embeddings are tied to the model** — search vectors stored in the database are only comparable to queries embedded with the same `EMBEDDING_MODEL`. Changing the model means re-uploading documents.
 
@@ -304,9 +352,11 @@ DocumentAssistant/
 ## Roadmap
 
 - ~~Persist documents and indexes (SQLite + rebuilt FAISS index)~~ ✅ done in M1
+- ~~User accounts and per-user document ownership~~ ✅ done in M2
 - Support several documents / global search across them
 - Add OCR for scanned PDFs
-- User accounts and per-user document ownership (M2)
+- Email verification, password reset, and login rate limiting
+- Document sharing between users
 - Stream answers to the browser (SSE)
 - Docker image for one-command deployment
 

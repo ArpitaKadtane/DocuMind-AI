@@ -58,6 +58,9 @@ class Settings:
     top_k: int = _get_int("TOP_K", 4)
     min_score: float = _get_float("MIN_SCORE", 0.15)
 
+    # Auth / sessions
+    session_ttl_hours: int = _get_int("SESSION_TTL_HOURS", 168)
+
     # Persistence
     data_dir: str = os.getenv("DATA_DIR", str(BASE_DIR / "data"))
 
