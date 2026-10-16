@@ -45,8 +45,9 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
 - 🤖 Answer generation via Groq's free-tier OpenAI-compatible API
 - 🚫 **Refuses to answer** when nothing relevant is found (score gate + prompt rule)
 - 🛡️ Prompt-injection defense: document text is treated as untrusted data
+- 💾 **Persistent storage** — uploaded PDFs, metadata, and search vectors are saved with SQLite and restored after a restart
 - 🌐 Simple built-in web frontend (plain HTML/JS, no build step)
-- ✅ 33 automated tests that run offline in <1 second
+- ✅ 40 automated tests that run offline in a few seconds
 
 ---
 
@@ -84,8 +85,8 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
                   │
                   ▼
         ┌──────────────────┐
-        │  FAISS index     │   (one per uploaded document,
-        │ (vector_store.py)│    stored in memory)
+        │  FAISS index     │   (one per uploaded document;
+        │ (vector_store.py)│    rebuilt from SQLite on startup)
         └──────────────────┘
 ```
 
@@ -147,6 +148,7 @@ Copy `.env.example` to `.env` and fill in your values. **Never commit `.env`** (
 | `EMBEDDING_MODEL` | `multi-qa-MiniLM-L6-cos-v1` | Hugging Face embedding model |
 | `MIN_SCORE` | `0.15` | Below this similarity, the app answers "not found" without calling the LLM |
 | `TOP_K` | `4` | How many chunks to retrieve |
+| `DATA_DIR` | `./data` | Directory for stored PDFs and the SQLite database (created automatically) |
 | `CHUNK_SIZE_CHARS` | `800` | Max characters per chunk |
 | `CHUNK_OVERLAP_CHARS` | `150` | Overlap between chunks |
 | `MAX_UPLOAD_MB` | `10` | Upload size limit |
@@ -163,6 +165,29 @@ uvicorn app.main:app --reload
 ```
 
 Open **http://127.0.0.1:8000/** for the web UI, or **http://127.0.0.1:8000/docs** for interactive Swagger docs.
+
+---
+
+## Persistence & local data
+
+Uploaded documents are **saved to disk** so they survive a server restart. On startup the app rebuilds its search index automatically.
+
+- **Location:** `data/` next to the `app/` package (override with `DATA_DIR`).
+  - `data/documents.sqlite3` — metadata, chunk text, and chunk embeddings.
+  - `data/files/<document_id>.pdf` — the original PDF, stored under a generated name (the user-supplied filename is never used as a path).
+- **Startup restore:** the app reads the database and rebuilds each document's in-memory FAISS index from the stored vectors. No model download or re-embedding is needed.
+- **Resilience:** if a stored PDF or a single record is missing or corrupt, the app logs a warning and skips it instead of crashing. If a stored PDF is gone, search still works because the chunks and vectors live in the database.
+- **API behaviour is unchanged:** responses never expose filesystem paths; documents are addressed only by `document_id`.
+- `data/` is **gitignored** — never commit it (it can contain real documents).
+
+**Reset local development data safely** (deletes all stored documents):
+
+```powershell
+# Stop the server first, then delete the runtime data folder.
+Remove-Item -Recurse -Force .\data
+```
+
+The folder is recreated automatically on the next upload or startup.
 
 ---
 
@@ -223,7 +248,7 @@ Example answer:
 pytest
 ```
 
-The suite covers document processing, chunking, vector search, RAG gating, and API behaviour — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request). Tests replace the embedding model and LLM with fakes, so they run **offline in ~0.3 s**.
+The suite covers document processing, chunking, vector search, RAG gating, API behaviour, and persistence — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request) and restart restoration (missing files, corrupt records). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
 
 ---
 
@@ -232,17 +257,19 @@ The suite covers document processing, chunking, vector search, RAG gating, and A
 ```
 DocumentAssistant/
 ├── app/
-│   ├── main.py            # FastAPI routes, middleware, in-memory store
+│   ├── main.py            # FastAPI routes, middleware, startup restore
 │   ├── config.py          # All settings loaded from .env
 │   ├── pdf_processor.py   # PDF validation + safe text extraction
 │   ├── chunking.py        # Sentence-aware chunking with overlap
 │   ├── embeddings.py      # Text → vectors (local model)
 │   ├── vector_store.py    # FAISS index wrapper
+│   ├── storage.py         # SQLite + file persistence (documents, chunks)
 │   ├── llm.py             # Groq API call + grounding prompt
 │   ├── rag.py             # Retrieval → score gate → answer
 │   └── static/index.html  # Web frontend
 ├── tests/                 # pytest suite (offline)
 ├── documents/             # Sample PDFs
+├── data/                  # Runtime data: uploaded PDFs + SQLite DB (gitignored)
 ├── .env.example           # Config template (safe to commit)
 ├── .env                   # Your secrets (never committed)
 ├── .gitignore
@@ -254,7 +281,7 @@ DocumentAssistant/
 ## Security notes
 
 - **Uploads are validated** by magic bytes (`%PDF-`), size, page count, and total text volume — renamed files and PDF bombs are rejected.
-- **Nothing is written to disk** — the file is processed in memory only, which removes path-traversal risk.
+- **Stored files use generated names** — uploaded PDFs are written under `data/files/<document_id>.pdf`, where `document_id` is a server-generated hex UUID. The user-supplied filename is never used as a path, so path traversal is not possible.
 - **Secrets live in `.env`** and are excluded from Git; the API key is only ever sent in an `Authorization` header (never logged or echoed).
 - **Logs contain metadata only** (document id, filename, page count, chunk count, found/not-found) — never document text, questions, answers, or keys.
 - **Prompt injection:** document text is wrapped in `<document_context>` tags and the system prompt marks it as untrusted data, so instructions embedded in a PDF are ignored.
@@ -264,21 +291,22 @@ DocumentAssistant/
 
 ## Limitations
 
-- **In-memory storage** — uploaded documents and indexes are lost on restart, and users don't share documents. Fine for a portfolio demo; a real product would use a database/object store.
+- **Local SQLite storage** — documents and their search indexes persist across restarts in `data/`, but everything runs on a single machine and users don't share documents. A real multi-user product would move to a database server plus object storage.
 - **One document at a time** — each document gets its own index; there is no global corpus search.
 - **Scanned/image-only PDFs** are rejected because there is no OCR step.
 - **`MIN_SCORE` tuning** — thresholds depend on the embedding model. If legitimate questions are answered "not found", lower `MIN_SCORE`; if wrong answers appear, raise it.
 - **No user authentication** — anyone who can reach the server can upload/ask.
 - **Free-tier Groq limits** — the model can change or be rate-limited; `GROQ_MODEL` is configurable for that reason. (`llama-3.3-70b-versatile` is now an Enterprise model and is **not** available on the free tier.)
-- Documents persist only while the process runs.
+- **Embeddings are tied to the model** — search vectors stored in the database are only comparable to queries embedded with the same `EMBEDDING_MODEL`. Changing the model means re-uploading documents.
 
 ---
 
 ## Roadmap
 
-- Store documents and indexes in a database (SQLite + saved FAISS index)
+- ~~Persist documents and indexes (SQLite + rebuilt FAISS index)~~ ✅ done in M1
 - Support several documents / global search across them
 - Add OCR for scanned PDFs
+- User accounts and per-user document ownership (M2)
 - Stream answers to the browser (SSE)
 - Docker image for one-command deployment
 

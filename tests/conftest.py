@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from app import embeddings, main
+from app.storage import DocumentStore
 
 
 class FakeEmbeddingModel:
@@ -48,6 +49,13 @@ def clean_documents():
     main.DOCUMENTS.clear()
     yield
     main.DOCUMENTS.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_storage(tmp_path, monkeypatch):
+    """Point persistence at a throwaway directory so tests never touch real data."""
+    monkeypatch.setattr(main, "DOCUMENT_STORE", DocumentStore(tmp_path / "data"))
+    yield
 
 
 @pytest.fixture

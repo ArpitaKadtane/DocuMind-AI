@@ -7,10 +7,15 @@ keeps secrets (like API keys) out of the source code. Copy .env.example to
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Project root (the folder that contains the "app" package). Runtime data such
+# as uploaded PDFs and the SQLite database lives here by default.
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def _get_int(name: str, default: int) -> int:
@@ -52,6 +57,9 @@ class Settings:
     # Retrieval
     top_k: int = _get_int("TOP_K", 4)
     min_score: float = _get_float("MIN_SCORE", 0.15)
+
+    # Persistence
+    data_dir: str = os.getenv("DATA_DIR", str(BASE_DIR / "data"))
 
 
 settings = Settings()

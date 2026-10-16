@@ -18,6 +18,12 @@ server_log.txt
 # Document data - may contain private/user PDFs. Never commit user documents.
 *.pdf
 
+# Runtime data - uploaded PDFs and the SQLite database (never commit)
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # OS / editor
 .vscode/
 .idea/

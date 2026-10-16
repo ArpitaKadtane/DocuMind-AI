@@ -1,6 +1,8 @@
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -18,6 +20,7 @@ from app.pdf_processor import (
     _max_bytes,
 )
 from app.rag import answer_question
+from app.storage import DocumentStore
 from app.vector_store import VectorStore
 
 logging.basicConfig(
@@ -37,8 +40,6 @@ for _noisy in (
 ):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-app = FastAPI(title="GenAI Document Assistant")
-
 logger = logging.getLogger("document_assistant")
 
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
@@ -46,9 +47,73 @@ MAX_UPLOAD_BYTES = _max_bytes()
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-# In-memory store: document_id -> metadata, chunks and vector index.
-# Deliberately kept in memory only and never written to disk or logged.
+# In-memory cache of loaded documents: document_id -> metadata, chunks, index.
+# This mirrors what is persisted on disk and is rebuilt on every startup.
 DOCUMENTS: dict[str, dict] = {}
+
+# SQLite + file persistence. Initialised lazily so tests can substitute a
+# temporary directory, and used to restore documents after a restart.
+DOCUMENT_STORE: DocumentStore | None = None
+
+
+def get_document_store() -> DocumentStore:
+    """Return the process-wide document store, creating it on first use."""
+    global DOCUMENT_STORE
+    if DOCUMENT_STORE is None:
+        DOCUMENT_STORE = DocumentStore(settings.data_dir)
+    return DOCUMENT_STORE
+
+
+def load_persisted_documents(store: DocumentStore | None = None) -> int:
+    """Rebuild the in-memory document cache from persistent storage.
+
+    Returns the number of documents restored. A single missing or corrupt
+    document is logged and skipped rather than crashing the whole application.
+    """
+    store = store or get_document_store()
+    try:
+        metadata = store.iter_documents()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Could not read persisted documents: %s", exc)
+        return 0
+
+    restored = 0
+    for meta in metadata:
+        document_id = meta["document_id"]
+        try:
+            if not store.stored_file_path(document_id).exists():
+                logger.warning(
+                    "Stored file missing for document id=%s; restoring search "
+                    "data from the database only",
+                    document_id,
+                )
+            chunks, embeddings = store.load_chunks(document_id)
+            vector_store = VectorStore()
+            if chunks:
+                vector_store.add(chunks, embeddings)
+            DOCUMENTS[document_id] = {
+                "filename": meta["filename"],
+                "pages": meta["pages"],
+                "characters": meta["characters"],
+                "chunks": chunks,
+                "store": vector_store,
+                "created_at": meta["created_at"],
+            }
+            restored += 1
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Skipping unreadable document id=%s: %s", document_id, exc)
+    return restored
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Restore persisted documents when the server starts."""
+    restored = load_persisted_documents()
+    logger.info("Restored %d persisted document(s) from storage.", restored)
+    yield
+
+
+app = FastAPI(title="GenAI Document Assistant", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):
@@ -120,18 +185,38 @@ async def upload_document(file: UploadFile = File(...)):
     document_id = uuid.uuid4().hex
     filename = os.path.basename(file.filename or "upload.pdf")
     chunks = chunk_text(text)
+    embeddings = embed_texts(chunks) if chunks else None
+    created_at = datetime.now(timezone.utc).isoformat()
 
-    store = VectorStore()
-    if chunks:
-        store.add(chunks, embed_texts(chunks))
+    vector_store = VectorStore()
+    if chunks and embeddings is not None:
+        vector_store.add(chunks, embeddings)
 
     DOCUMENTS[document_id] = {
         "filename": filename,
         "pages": page_count,
-        "text": text,
+        "characters": len(text),
         "chunks": chunks,
-        "store": store,
+        "store": vector_store,
+        "created_at": created_at,
     }
+
+    # Persist to disk so the document survives a restart. A storage failure is
+    # logged but must not fail the request: the document still works in memory.
+    try:
+        get_document_store().save_document(
+            document_id=document_id,
+            filename=filename,
+            stored_bytes=data,
+            pages=page_count,
+            characters=len(text),
+            chunks=chunks,
+            embeddings=embeddings,
+            embedding_model=settings.embedding_model,
+            created_at=created_at,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Could not persist document id=%s: %s", document_id, exc)
 
     # Log metadata only -- never the extracted text.
     logger.info(
@@ -205,6 +290,6 @@ def get_document_meta(document_id: str):
         "document_id": document_id,
         "filename": doc["filename"],
         "pages": doc["pages"],
-        "characters": len(doc["text"]),
+        "characters": doc["characters"],
         "chunks": len(doc["chunks"]),
     }
