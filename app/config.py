@@ -58,6 +58,11 @@ class Settings:
     top_k: int = _get_int("TOP_K", 4)
     min_score: float = _get_float("MIN_SCORE", 0.15)
 
+    # Summaries
+    summary_max_chars: int = _get_int("SUMMARY_MAX_CHARS", 12000)
+    summary_max_tokens: int = _get_int("SUMMARY_MAX_TOKENS", 700)
+    summary_max_points: int = _get_int("SUMMARY_MAX_POINTS", 8)
+
     # Auth / sessions
     session_ttl_hours: int = _get_int("SESSION_TTL_HOURS", 168)
 

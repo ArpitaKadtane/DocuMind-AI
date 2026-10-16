@@ -45,11 +45,12 @@ So the model doesn't need to "know" your document in advance, and it doesn't nee
 - 🤖 Answer generation via Groq's free-tier OpenAI-compatible API
 - 🚫 **Refuses to answer** when nothing relevant is found (score gate + prompt rule)
 - 📑 **Page-aware citations** — every answer cites the PDF page(s) it used, and search hits carry the filename + 1-based page number
+- 📝 **AI summaries & key points** — one click summarizes a whole document and lists its most important points, grounded in the text; large PDFs are sampled evenly so the beginning, middle, and end all count
 - 🛡️ Prompt-injection defense: document text is treated as untrusted data
 - 💾 **Persistent storage** — uploaded PDFs, metadata, and search vectors are saved with SQLite and restored after a restart
 - 🔐 **Accounts & per-user ownership** — register/login with bearer tokens; users can only see and query their own documents
 - 🌐 Simple built-in web frontend (plain HTML/JS, no build step)
-- ✅ 82 automated tests that run offline in a few seconds
+- ✅ 101 automated tests that run offline in a few seconds
 
 ---
 
@@ -151,6 +152,9 @@ Copy `.env.example` to `.env` and fill in your values. **Never commit `.env`** (
 | `EMBEDDING_MODEL` | `multi-qa-MiniLM-L6-cos-v1` | Hugging Face embedding model |
 | `MIN_SCORE` | `0.15` | Below this similarity, the app answers "not found" without calling the LLM |
 | `TOP_K` | `4` | How many chunks to retrieve |
+| `SUMMARY_MAX_CHARS` | `12000` | If a document is larger than this, summary chunks are sampled evenly across it |
+| `SUMMARY_MAX_TOKENS` | `700` | Max tokens the model may use for a summary |
+| `SUMMARY_MAX_POINTS` | `8` | Max number of key points to return |
 | `DATA_DIR` | `./data` | Directory for stored PDFs and the SQLite database (created automatically) |
 | `SESSION_TTL_HOURS` | `168` | How long a login token stays valid (7 days) |
 | `CHUNK_SIZE_CHARS` | `800` | Max characters per chunk |
@@ -234,6 +238,7 @@ Every user must **register** and **log in** before they can upload or query docu
 | `GET` | `/documents/{id}` | Document metadata (not the text) | ✔ |
 | `POST` | `/documents/{id}/search?query=…` | Raw retrieval — matched chunks with `filename`, `page`, and `score` | ✔ |
 | `POST` | `/documents/{id}/ask` | RAG Q&A — body: `{"question": "…"}` | ✔ |
+| `POST` | `/documents/{id}/summary` | Whole-document summary + key points | ✔ |
 
 **Example:**
 
@@ -297,6 +302,34 @@ match, so retrieval is page-aware too:
 }
 ```
 
+### Summaries
+
+`POST /documents/{id}/summary` summarizes a whole document and lists its key
+points. Unlike Q&A (which retrieves only the chunks most similar to a question),
+it reads the document's chunks directly so the summary covers the whole
+document. When a document is larger than `SUMMARY_MAX_CHARS`, chunks are sampled
+**evenly** across it so the beginning, middle, and end are all represented —
+`truncated: true` tells you that sampling happened. The response reuses the
+citation shape in `sources` and never invents page numbers.
+
+```json
+{
+  "document_id": "…",
+  "filename": "sample.pdf",
+  "summary": "The report covers the Phase One budget, timeline, and risks.",
+  "key_points": [
+    "Phase One budget is 5000 credits.",
+    "Launch is scheduled for Q3.",
+    "The main risk is vendor lead time."
+  ],
+  "found": true,
+  "truncated": false,
+  "sources": [
+    {"filename": "sample.pdf", "page": 1, "text": "The total budget for phase one is 5000 credits."}
+  ]
+}
+```
+
 ---
 
 ## How the answer is generated
@@ -322,7 +355,7 @@ match, so retrieval is page-aware too:
 pytest
 ```
 
-The suite covers document processing, chunking, vector search, RAG gating, API behaviour, persistence, authentication/ownership, and **page-aware citations** — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request), restart restoration (missing files, corrupt records), page metadata surviving a restart, legacy chunks without a page ("page unavailable"), the chunks-table migration, and auth cases (unauthenticated requests, invalid tokens, logout, cross-user access, legacy documents, schema migration). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
+The suite covers document processing, chunking, vector search, RAG gating, API behaviour, persistence, authentication/ownership, **page-aware citations**, and **summaries & key points** — including error cases (fake PDFs, wrong content type, unknown document, LLM failure, oversized request), restart restoration (missing files, corrupt records), page metadata surviving a restart, legacy chunks without a page ("page unavailable"), the chunks-table migration, summary output parsing and large-PDF chunk sampling, and auth cases (unauthenticated requests, invalid tokens, logout, cross-user access, legacy documents, schema migration). Tests replace the embedding model and LLM with fakes and use a temporary data directory, so they run **offline in a few seconds**.
 
 ---
 
@@ -342,6 +375,7 @@ DocumentAssistant/
 │   ├── security.py        # scrypt password hashing + token helpers
 │   ├── llm.py             # Groq API call + grounding prompt
 │   ├── rag.py             # Retrieval → score gate → answer
+│   ├── summary.py         # Whole-document summarization (grounded, page-aware)
 │   └── static/index.html  # Web frontend (with sign-in)
 ├── tests/                 # pytest suite (offline)
 ├── documents/             # Sample PDFs
@@ -387,6 +421,7 @@ DocumentAssistant/
 - ~~Persist documents and indexes (SQLite + rebuilt FAISS index)~~ ✅ done in M1
 - ~~User accounts and per-user document ownership~~ ✅ done in M2
 - ~~Page-aware citations (filename + page in search and answers)~~ ✅ done in M3
+- ~~AI summaries & key points~~ ✅ done in M4
 - Support several documents / global search across them
 - Add OCR for scanned PDFs
 - Email verification, password reset, and login rate limiting

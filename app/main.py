@@ -23,6 +23,7 @@ from app.pdf_processor import (
 )
 from app.rag import answer_question
 from app.storage import DocumentStore
+from app.summary import summarize_document
 from app.vector_store import VectorStore
 
 logging.basicConfig(
@@ -339,6 +340,33 @@ def ask_document(
     return {
         "document_id": document_id,
         "question": question,
+        **result,
+    }
+
+
+@app.post("/documents/{document_id}/summary")
+def summarize_document_endpoint(
+    document_id: str,
+    doc: dict = Depends(get_owned_document),
+):
+    """Summarize a whole document and list its key points."""
+    try:
+        result = summarize_document(
+            doc["chunks"], doc["chunk_pages"], filename=doc["filename"]
+        )
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Log only metadata -- never the document text or the generated summary.
+    logger.info(
+        "summarized document=%s found=%s truncated=%s",
+        document_id,
+        result["found"],
+        result["truncated"],
+    )
+    return {
+        "document_id": document_id,
+        "filename": doc["filename"],
         **result,
     }
 
