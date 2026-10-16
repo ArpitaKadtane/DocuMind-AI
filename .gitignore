@@ -1,0 +1,25 @@
+# Local secrets - NEVER commit
+.env
+
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs and local artifacts
+*.log
+server_log.txt
+
+# Document data - may contain private/user PDFs. Never commit user documents.
+*.pdf
+
+# OS / editor
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
